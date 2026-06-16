@@ -9,7 +9,6 @@ dependencies = [
     "google-genai>=2.8.0",
     "groq>=1.4.0",
     "httpx>=0.28.1",
-    "jwt>=1.4.0",
     "langchain-google-genai>=4.2.5",
     "langchain-text-splitters>=1.1.2",
     "pinecone>=9.1.0",

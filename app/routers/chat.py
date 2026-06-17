@@ -190,12 +190,12 @@ async def chat(
 
         try:
             async for token in stream_response(
-                user_message=body.message.strip(),
-                retrieved_chunks=relevant_chunks,
-                conversation_history=conversation_history,
-                user_name=user_name,
-                ai_name=ai_name,
-                total_entries=total_entries,
+            user_message=body.message.strip(),
+            retrieved_chunks=relevant_chunks,
+            conversation_history=conversation_history,
+            user_name=user_name,
+            ai_name=ai_name,
+            total_entries=total_entries,
         ):
                 full_response_parts.append(token)
                 yield f"data: {json.dumps({'token': token})}\n\n"

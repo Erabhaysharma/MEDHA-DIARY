@@ -185,18 +185,19 @@ async def chat(
     # ── Step 8: Stream the response ──────────────────────────────────────────
     # This is an async generator that yields SSE events
     # Each event is a JSON string the mobile app reads and appends
+        # ── Step 8: Stream the response ──────────────────────────────────────────
     async def generate():
         full_response_parts = []
 
         try:
             async for token in stream_response(
-            user_message=body.message.strip(),
-            retrieved_chunks=relevant_chunks,
-            conversation_history=conversation_history,
-            user_name=user_name,
-            ai_name=ai_name,
-            total_entries=total_entries,
-        ):
+                user_message=body.message.strip(),
+                retrieved_chunks=relevant_chunks,
+                conversation_history=conversation_history,
+                user_name=user_name,
+                ai_name=ai_name,
+                total_entries=total_entries,
+            ):
                 full_response_parts.append(token)
                 yield f"data: {json.dumps({'token': token})}\n\n"
 
@@ -204,49 +205,56 @@ async def chat(
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
             return
 
-    # ── Save complete assistant response to Supabase ──────────────────
+        # ── Save complete assistant response to Supabase ──────────────────
         complete_response = "".join(full_response_parts)
 
         if complete_response:
             try:
                 supabase.table("chat_messages").insert({
-                "session_id":       body.session_id,
-                "user_id":          user_id,
-                "role":             "assistant",
-                "content":          complete_response,
-                "source_entry_ids": source_entry_ids,
-                "source_dates":     source_dates,
-            }).execute()
+                    "session_id": body.session_id,
+                    "user_id": user_id,
+                    "role": "assistant",
+                    "content": complete_response,
+                    "source_entry_ids": source_entry_ids,
+                    "source_dates": source_dates,
+                }).execute()
             except Exception:
                 pass
 
-    # ── Auto-update session title from first user message ─────────────
-    try:
-        session_data = supabase.table("chat_sessions")\
-            .select("title")\
-            .eq("id", body.session_id)\
-            .execute()
-
-        if session_data.data and session_data.data[0]["title"] == "New conversation":
-            auto_title = body.message.strip()[:50]
-            supabase.table("chat_sessions")\
-                .update({"title": auto_title})\
-                .eq("id", body.session_id)\
+        # ── Auto-update session title from first user message ─────────────
+        try:
+            session_data = (
+                supabase.table("chat_sessions")
+                .select("title")
+                .eq("id", body.session_id)
                 .execute()
-    except Exception:
-        pass  # Don't break chat if title update fails
+            )
 
-    # ── Send done signal with source dates ────────────────────────────
-    yield f"data: {json.dumps({'done': True, 'sources': source_dates})}\n\n"
+            if (
+                session_data.data
+                and session_data.data[0]["title"] == "New conversation"
+            ):
+                auto_title = body.message.strip()[:50]
+
+                (
+                    supabase.table("chat_sessions")
+                    .update({"title": auto_title})
+                    .eq("id", body.session_id)
+                    .execute()
+                )
+        except Exception:
+            pass
+
+        # ── Send done signal with source dates ────────────────────────────
+        yield f"data: {json.dumps({'done': True, 'sources': source_dates})}\n\n"
 
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
         headers={
-            # Prevent any proxy or CDN from buffering the stream
-            "Cache-Control":     "no-cache",
+            "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
-            "Connection":        "keep-alive",
+            "Connection": "keep-alive",
         },
     )
 

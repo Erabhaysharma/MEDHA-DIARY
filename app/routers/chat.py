@@ -196,40 +196,48 @@ async def chat(
                 user_name=user_name,
                 ai_name=ai_name,
                 total_entries=total_entries,
-            ):
+        ):
                 full_response_parts.append(token)
-
-                # Send each token as a Server-Sent Event
-                # Mobile app reads these and appends to the message bubble
                 yield f"data: {json.dumps({'token': token})}\n\n"
 
         except Exception as e:
-            # If streaming fails mid-way, send an error event
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
             return
 
-        # ── Save complete assistant response to Supabase ─────────────────
-        # We only save after streaming is complete
-        # so we have the full text to store
+    # ── Save complete assistant response to Supabase ──────────────────
         complete_response = "".join(full_response_parts)
 
         if complete_response:
             try:
                 supabase.table("chat_messages").insert({
-                    "session_id":       body.session_id,
-                    "user_id":          user_id,
-                    "role":             "assistant",
-                    "content":          complete_response,
-                    "source_entry_ids": source_entry_ids,
-                    "source_dates":     source_dates,
-                }).execute()
+                "session_id":       body.session_id,
+                "user_id":          user_id,
+                "role":             "assistant",
+                "content":          complete_response,
+                "source_entry_ids": source_entry_ids,
+                "source_dates":     source_dates,
+            }).execute()
             except Exception:
                 pass
 
-        # ── Send done signal with source dates ───────────────────────────
-        # Mobile app uses source_dates to show citation chips
-        # under Medha's response: "June 1" "April 2" etc.
-        yield f"data: {json.dumps({'done': True, 'sources': source_dates})}\n\n"
+    # ── Auto-update session title from first user message ─────────────
+    try:
+        session_data = supabase.table("chat_sessions")\
+            .select("title")\
+            .eq("id", body.session_id)\
+            .execute()
+
+        if session_data.data and session_data.data[0]["title"] == "New conversation":
+            auto_title = body.message.strip()[:50]
+            supabase.table("chat_sessions")\
+                .update({"title": auto_title})\
+                .eq("id", body.session_id)\
+                .execute()
+    except Exception:
+        pass  # Don't break chat if title update fails
+
+    # ── Send done signal with source dates ────────────────────────────
+    yield f"data: {json.dumps({'done': True, 'sources': source_dates})}\n\n"
 
     return StreamingResponse(
         generate(),
@@ -308,3 +316,98 @@ async def get_session_messages(
         "session_id": session_id,
         "messages":   messages.data or [],
     }
+
+# ─── Get all chat sessions for sidebar ───────────────────────────────────────
+@router.get(
+    "/chat/sessions",
+    summary="Get all chat sessions for the current user",
+)
+async def get_all_sessions(
+    user_id: str = Depends(verify_token),
+):
+    """
+    Returns all chat sessions grouped for the sidebar.
+    Mobile app calls this when user opens the chat sidebar.
+    """
+    supabase = get_supabase()
+
+    # Get all sessions for this user, newest first
+    sessions = supabase.table("chat_sessions")\
+        .select("id, title, created_at")\
+        .eq("user_id", user_id)\
+        .order("created_at", desc=True)\
+        .execute()
+
+    if not sessions.data:
+        return []
+
+    result = []
+    for session in sessions.data:
+        # Get the last message for preview
+        last_msg = supabase.table("chat_messages")\
+            .select("content, role")\
+            .eq("session_id", session["id"])\
+            .eq("user_id", user_id)\
+            .order("created_at", desc=True)\
+            .limit(1)\
+            .execute()
+
+        last_message = ""
+        if last_msg.data:
+            last_message = last_msg.data[0]["content"][:60] + "..." \
+                if len(last_msg.data[0]["content"]) > 60 \
+                else last_msg.data[0]["content"]
+
+        result.append({
+            "session_id":   session["id"],
+            "title":        session.get("title") or "New conversation",
+            "created_at":   session["created_at"],
+            "last_message": last_message,
+        })
+
+    return result
+
+
+# ─── Get messages for a session (sidebar load) ────────────────────────────────
+@router.get(
+    "/chat/session/{session_id}/messages",
+    summary="Get messages in a session for sidebar reload",
+)
+async def get_session_messages_list(
+    session_id: str,
+    user_id:    str = Depends(verify_token),
+):
+    """
+    Returns messages as a simple list for the chat sidebar.
+    When user taps a past session, mobile loads it with this.
+    """
+    supabase = get_supabase()
+
+    # Verify session belongs to this user first
+    session_check = supabase.table("chat_sessions")\
+        .select("id")\
+        .eq("id", session_id)\
+        .eq("user_id", user_id)\
+        .execute()
+
+    if not session_check.data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found",
+        )
+
+    messages = supabase.table("chat_messages")\
+        .select("role, content, created_at, source_dates")\
+        .eq("session_id", session_id)\
+        .eq("user_id", user_id)\
+        .order("created_at", desc=False)\
+        .execute()
+
+    # Return in format chatService expects
+    return [
+        {
+            "role":    msg["role"],
+            "content": msg["content"],
+        }
+        for msg in (messages.data or [])
+    ]

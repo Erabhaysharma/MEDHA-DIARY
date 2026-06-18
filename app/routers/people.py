@@ -405,3 +405,153 @@ def get_vibe_emoji(sentiment: float) -> str:
     if sentiment >= -0.1: return "😐"
     if sentiment >= -0.4: return "😔"
     return "💔"
+
+# ─── POST /api/extract-people/all ────────────────────────────────────────────
+@router.post("/extract-people/all")
+async def extract_all_people(
+    user_id: str = Depends(verify_token),
+):
+    """
+    Bulk extract people from ALL diary entries for this user.
+    Called when people screen is empty.
+    """
+    supabase = get_supabase()
+
+    # Get all diary entries for this user
+    entries_resp = supabase.table("diary_entries")\
+        .select("id, content, entry_date")\
+        .eq("user_id", user_id)\
+        .order("entry_date", desc=False)\
+        .execute()
+
+    entries = entries_resp.data or []
+
+    if not entries:
+        return {"extracted": 0, "message": "No diary entries found"}
+
+    total_extracted = 0
+
+    for entry in entries:
+        try:
+            entry_id   = entry["id"]
+            content    = entry["content"]
+            entry_date = entry["entry_date"]
+
+            if not content or not content.strip():
+                continue
+
+            prompt = f"""Analyze this diary entry and extract all people mentioned.
+
+DIARY ENTRY ({entry_date}):
+{content}
+
+Return ONLY valid JSON — no explanation, no markdown:
+{{
+  "people": [
+    {{
+      "name": "exact name as written",
+      "relationship": "friend|family|colleague|romantic|acquaintance|other",
+      "sentiment": 0.8,
+      "context": "one sentence about what was written about this person"
+    }}
+  ]
+}}
+
+Rules:
+- Only include real people (not places, brands, or abstract concepts)
+- sentiment is a float from -1.0 to 1.0
+- relationship must be one of: friend, family, colleague, romantic, acquaintance, other
+- If no people mentioned return {{"people": []}}
+- Common family terms: Mom, Dad, Bhai, Didi, Mama, Chacha = family"""
+
+            response = _groq.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {
+                        "role":    "system",
+                        "content": "You extract people from diary entries. Return only valid JSON.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=512,
+                temperature=0.1,
+            )
+
+            raw = response.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            raw = raw.strip()
+
+            parsed = json.loads(raw)
+            people = parsed.get("people", [])
+
+            for person in people:
+                name         = person.get("name", "").strip()
+                relationship = person.get("relationship", "other")
+                sentiment    = float(person.get("sentiment", 0.0))
+                context      = person.get("context", "")
+
+                if not name:
+                    continue
+
+                sentiment = max(-1.0, min(1.0, sentiment))
+
+                existing = supabase.table("people")\
+                    .select("id, mention_count, sentiment_avg")\
+                    .eq("user_id", user_id)\
+                    .ilike("name", name)\
+                    .execute()
+
+                if existing.data:
+                    person_id     = existing.data[0]["id"]
+                    old_count     = existing.data[0]["mention_count"] or 1
+                    old_sentiment = existing.data[0]["sentiment_avg"] or 0.0
+                    new_sentiment = round(
+                        (old_sentiment * old_count + sentiment) / (old_count + 1), 3
+                    )
+                    supabase.table("people").update({
+                        "mention_count":  old_count + 1,
+                        "sentiment_avg":  new_sentiment,
+                        "last_mentioned": entry_date,
+                        "relationship":   relationship,
+                    }).eq("id", person_id).execute()
+                else:
+                    result = supabase.table("people").insert({
+                        "user_id":        user_id,
+                        "name":           name,
+                        "relationship":   relationship,
+                        "sentiment_avg":  sentiment,
+                        "mention_count":  1,
+                        "last_mentioned": entry_date,
+                    }).execute()
+                    person_id = result.data[0]["id"] if result.data else None
+
+                if not person_id:
+                    continue
+
+                already_linked = supabase.table("entry_people")\
+                    .select("id")\
+                    .eq("entry_id",  entry_id)\
+                    .eq("person_id", person_id)\
+                    .execute()
+
+                if not already_linked.data:
+                    supabase.table("entry_people").insert({
+                        "entry_id":        entry_id,
+                        "person_id":       person_id,
+                        "user_id":         user_id,
+                        "sentiment_score": sentiment,
+                        "context_snippet": context,
+                    }).execute()
+
+                total_extracted += 1
+
+        except Exception:
+            continue  # Skip failed entries, don't break the whole process
+
+    return {
+        "extracted": total_extracted,
+        "entries_processed": len(entries),
+    }

@@ -100,6 +100,10 @@ app.include_router(
     prefix="/api",
     tags=["Memories"],
 )
+#_____________Extented feature for add socisl diary feature____________________
+from app.routers import social as social_router   # ← add this
+
+app.include_router(social_router.router, prefix="/api", tags=["Social"])  # ← add this
 
 # ─── Health check endpoints ───────────────────────────────────────────────────
 

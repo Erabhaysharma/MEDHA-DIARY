@@ -33,27 +33,45 @@ async def create_post(body: PostCreate, user_id: str = Depends(verify_token)):
     sb.rpc("increment_shares", {"uid": user_id}).execute()
     return post.data[0]
 
-
 @router.get("/social/feed")
 async def get_feed(page: int = 0, user_id: str = Depends(verify_token)):
     sb = get_sb()
     limit  = 20
     offset = page * limit
+
     posts = sb.table("social_posts") \
-        .select("*, diary_entries(content, entry_date, mood_label), profiles(display_name)") \
+        .select("*") \
         .order("created_at", desc=True) \
         .range(offset, offset + limit - 1) \
         .execute()
+
     if not posts.data:
         return []
+
     result = []
     for p in posts.data:
-        post_id  = p["id"]
+        post_id = p["id"]
+
+        # Fetch entry separately
+        entry_row = sb.table("diary_entries") \
+            .select("content, entry_date, mood_label") \
+            .eq("id", p["entry_id"]) \
+            .single() \
+            .execute()
+        entry = entry_row.data or {}
+
+        # Fetch profile separately
+        profile_row = sb.table("profiles") \
+            .select("display_name") \
+            .eq("id", p["user_id"]) \
+            .single() \
+            .execute()
+        profile = profile_row.data or {}
+
         likes    = sb.table("post_likes").select("user_id", count="exact").eq("post_id", post_id).execute()
         comments = sb.table("post_comments").select("id", count="exact").eq("post_id", post_id).execute()
         my_like  = sb.table("post_likes").select("user_id").eq("post_id", post_id).eq("user_id", user_id).execute()
-        entry    = p.get("diary_entries") or {}
-        profile  = p.get("profiles") or {}
+
         result.append({
             "id":             post_id,
             "user_id":        p["user_id"],
@@ -70,8 +88,8 @@ async def get_feed(page: int = 0, user_id: str = Depends(verify_token)):
             "comments_count": comments.count or 0,
             "liked_by_me":    len(my_like.data) > 0,
         })
-    return result
 
+    return result
 
 @router.post("/social/post/{post_id}/like")
 async def toggle_like(post_id: str, user_id: str = Depends(verify_token)):

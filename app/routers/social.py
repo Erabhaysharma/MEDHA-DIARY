@@ -213,3 +213,42 @@ Respond ONLY with valid JSON, no extra text:
             "can_publish":       True,
             "threshold":         60,
         }
+    
+class ContentRequest(BaseModel):
+    content:   str
+    format_id: str  # animation | creative | drama | comedy | thriller
+
+@router.post("/social/generate-content")
+async def generate_content(body: ContentRequest, user_id: str = Depends(verify_token)):
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+    format_labels = {
+        "animation": "animation short script",
+        "creative":  "vivid literary rewrite",
+        "drama":     "dramatic short film screenplay",
+        "comedy":    "lighthearted comedic short film script",
+        "thriller":  "suspenseful thriller short film script",
+    }
+    label = format_labels.get(body.format_id, "creative piece")
+
+    if body.format_id == "creative":
+        prompt = f"""Rewrite this personal diary entry as a vivid, literary, emotionally rich short piece. Keep the core truth but make it more expressive and unique:
+
+"{body.content}"
+
+Write only the rewritten piece, no preamble."""
+    else:
+        prompt = f"""Transform this personal diary entry into a {label}. Make it compelling, authentic to the emotion, and ready to visualize. Include scene directions and dialogue.
+
+Diary:
+"{body.content}"
+
+Write only the script/piece, no preamble."""
+
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.8,
+        max_tokens=800,
+    )
+    return {"result": response.choices[0].message.content.strip()}

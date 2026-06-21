@@ -135,3 +135,81 @@ async def add_comment(post_id: str, body: CommentCreate, user_id: str = Depends(
         "content": body.content,
     }).execute()
     return row.data[0]
+
+
+#model to check authenticity
+from groq import Groq
+import json
+
+class DiaryScoreRequest(BaseModel):
+    content: str
+
+@router.post("/social/score-diary")
+async def score_diary(body: DiaryScoreRequest, user_id: str = Depends(verify_token)):
+    """
+    Score a diary entry for authenticity, emotion, detail, and originality.
+    Returns scores and a pass/fail against threshold.
+    """
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+    prompt = f"""You are a diary authenticity evaluator. Analyze this diary entry and score it.
+
+Diary entry:
+\"\"\"{body.content}\"\"\"
+
+Score on these 4 dimensions (each 0-25, total out of 100):
+1. Detail Score (0-25): Does it describe a specific event, place, or situation with details?
+2. Emotion Score (0-25): Does it contain genuine emotions, feelings, or personal reactions?
+3. Clarity Score (0-25): Is there a clear event or story arc? Is it readable?
+4. Originality Score (0-25): Is it personal and unique, NOT generic or copy-paste-like?
+
+Respond ONLY with valid JSON, no extra text:
+{{
+  "detail_score": <0-25>,
+  "emotion_score": <0-25>,
+  "clarity_score": <0-25>,
+  "originality_score": <0-25>,
+  "total_score": <0-100>,
+  "emotional_impact": "<Low|Medium|High>",
+  "feedback": "<one encouraging sentence about what's good>",
+  "improvement": "<one sentence on what could be better, or empty string if total >= 75>"
+}}"""
+
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=300,
+        )
+        raw = response.choices[0].message.content.strip()
+        # Strip markdown fences if present
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        scores = json.loads(raw)
+
+        # Ensure total is computed correctly
+        scores["total_score"] = (
+            scores.get("detail_score", 0) +
+            scores.get("emotion_score", 0) +
+            scores.get("clarity_score", 0) +
+            scores.get("originality_score", 0)
+        )
+        scores["can_publish"] = scores["total_score"] >= 60
+        scores["threshold"]   = 60
+
+        return scores
+
+    except Exception as e:
+        # Fail open — if scoring fails, allow publish
+        return {
+            "detail_score":      20,
+            "emotion_score":     20,
+            "clarity_score":     20,
+            "originality_score": 20,
+            "total_score":       80,
+            "emotional_impact":  "Medium",
+            "feedback":          "Your diary looks great!",
+            "improvement":       "",
+            "can_publish":       True,
+            "threshold":         60,
+        }

@@ -100,6 +100,9 @@ app.include_router(
     prefix="/api",
     tags=["Memories"],
 )
+
+from app.routers import astro as astro_router
+app.include_router(astro_router.router, prefix="/api", tags=["Astro"])
 #_____________Extented feature for add socisl diary feature____________________
 from app.routers import social as social_router   # ← add this
 

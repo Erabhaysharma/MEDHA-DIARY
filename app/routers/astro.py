@@ -1,6 +1,5 @@
 """
 astro.py — Astro Medha premium backend
-Handles zodiac calculation, daily forecast, and astro chat.
 """
 
 import os
@@ -57,123 +56,26 @@ ZODIAC_TRAITS = {
 }
 
 
-# ── Models ────────────────────────────────────────────────────────────────────
+# ── Pydantic models ───────────────────────────────────────────────────────────
 class OnboardingData(BaseModel):
-    dob:         str   # YYYY-MM-DD
-    birth_time:  str   # HH:MM or "unknown"
+    dob:         str
+    birth_time:  str
     birth_place: str
 
-
 class AstroChatMessage(BaseModel):
-    session_id: str | None
+    session_id: str | None = None
     message:    str
+
 class LanguageUpdate(BaseModel):
     language: str  # 'hindi' or 'english'
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
 
-@router.post("/astro/language")
-async def update_language(body: LanguageUpdate, user_id: str = Depends(verify_token)):
-    sb = get_sb()
-    if body.language not in ("hindi", "english"):
-        raise HTTPException(status_code=400, detail="language must be 'hindi' or 'english'")
-    sb.table("profiles").update({"astro_language": body.language})\
-        .eq("id", user_id).execute()
-    return {"language": body.language}
-
-
-
-
-@router.post("/astro/onboard")
-async def astro_onboard(body: OnboardingData, user_id: str = Depends(verify_token)):
-    sb     = get_sb()
-    zodiac = get_zodiac(body.dob)
-
-    # Check current state
-    profile_res = sb.table("profiles")\
-        .select("astro_onboarded, astro_edit_count")\
-        .eq("id", user_id).single().execute()
-    profile     = profile_res.data or {}
-
-    already_onboarded = profile.get("astro_onboarded", False)
-    edit_count        = profile.get("astro_edit_count", 0)
-
-    # If editing (not first time), check limit
-    if already_onboarded:
-        if edit_count >= 2:
-            raise HTTPException(
-                status_code=403,
-                detail="You have used both your allowed birth info edits."
-            )
-        new_edit_count = edit_count + 1
-    else:
-        new_edit_count = 0  # first time setup doesn't count
-
-    sb.table("profiles").update({
-        "dob":             body.dob,
-        "birth_time":      body.birth_time,
-        "birth_place":     body.birth_place,
-        "zodiac_sign":     zodiac,
-        "astro_onboarded": True,
-        "astro_edit_count": new_edit_count,
-    }).eq("id", user_id).execute()
-
-    return {
-        "zodiac_sign":     zodiac,
-        "astro_edit_count": new_edit_count,
-        "message":         "Astro profile saved",
-    }
-
-@router.get("/astro/profile")
-async def get_astro_profile(user_id: str = Depends(verify_token)):
-    sb  = get_sb()
-    res = sb.table("profiles")\
-        .select("is_premium, astro_onboarded, dob, birth_time, birth_place, zodiac_sign, display_name, astro_edit_count, astro_language")\
-        .eq("id", user_id).single().execute()
-    return res.data or {}
-
-
-@router.get("/astro/forecast")
-async def get_daily_forecast(user_id: str = Depends(verify_token)):
-    sb    = get_sb()
-    today = date.today().isoformat()
-
-    # Return cached forecast if already generated today
-    cached = sb.table("astro_forecasts")\
-        .select("forecast")\
-        .eq("user_id", user_id)\
-        .eq("date", today)\
-        .execute()
-
-    if cached.data:
-        return {"forecast": cached.data[0]["forecast"], "date": today, "cached": True}
-
-    # Get user astro profile
-    profile_res = sb.table("profiles")\
-        .select("zodiac_sign, dob, birth_place, display_name, ai_name, astro_language")\
-        .eq("id", user_id).single().execute()
-    profile = profile_res.data or {}
-
-    language = profile.get("astro_language", "english")
-
-    if language == "hindi":
-        lang_note = """पूरी राशिफल हिंदी में लिखें। इन शब्दों का उपयोग करें:
-                        राशि, कुंडली, लग्न, चंद्र राशि, ग्रह, गोचर, भाग्य, करियर, प्रेम, स्वास्थ्य।
-
-                        अंत में यह पंक्ति जोड़ें:
-                        *यह राशिफल ज्योतिष के आधार पर है। सुनिश्चित परिणाम नहीं।*"""
-    else:
-        lang_note = """Write the forecast in English.
-
-                    End with:
-                    *All insights are based on Vedic astrology and your personal profile. Medha's answers reflect astrological patterns, not guaranteed outcomes.*"""
-
-
+# ── Helper: build forecast for a user ────────────────────────────────────────
+async def _generate_forecast(user_id: str, language: str, profile: dict, sb) -> str:
     zodiac = profile.get("zodiac_sign", "Unknown")
     name   = (profile.get("display_name") or "").split(" ")[0] or "you"
     traits = ZODIAC_TRAITS.get(zodiac, "thoughtful and sensitive")
 
-    # Get recent diary entries for emotional context
     entries_res = sb.table("diary_entries")\
         .select("content, entry_date, mood_label")\
         .eq("user_id", user_id)\
@@ -190,23 +92,34 @@ async def get_daily_forecast(user_id: str = Depends(verify_token)):
 
     today_fmt = datetime.now().strftime("%A, %d %B %Y")
 
-    prompt = f"""You are Astro Medha, a warm and wise astrology guide who blends cosmic wisdom with personal insight.
+    if language == "hindi":
+        structure = """🌅 **आज की ऊर्जा**
+इस राशि के लिए आज के दिन की समग्र ऊर्जा के बारे में 2-3 वाक्य।
 
-Today is {today_fmt}.
-User's sun sign: {zodiac}
-Their nature: {traits}
-Born in: {profile.get('birth_place', 'India')}
+💼 **कार्य और महत्वाकांक्षा**
+आज के करियर/पढ़ाई की ऊर्जा के बारे में 1-2 वाक्य।
 
-Their recent diary entries:
-{diary_context if diary_context else "No recent entries."}
+❤️ **दिल और रिश्ते**
+आज की भावनात्मक और प्रेम ऊर्जा के बारे में 1-2 वाक्य।
 
-Write a warm, personal daily rasiphal (horoscope) for {name} today. Structure it exactly like this:
+🌿 **आज क्या करें**
+राशि और डायरी के मूड के अनुसार 2-3 व्यावहारिक सुझाव।
 
-🌅 **Today's Energy**
-2-3 sentences about the overall energy of the day for this sign. Make it feel cosmic but grounded.
+⚠️ **किससे बचें**
+1-2 सच्ची सावधानियाँ।
+
+✨ **मेधा का ब्रह्मांडीय संदेश**
+एक व्यक्तिगत वाक्य जो उनकी डायरी की भावनाओं को आज की ब्रह्मांडीय ऊर्जा से जोड़े।
+
+अंत में यह पंक्ति लिखें:
+*यह राशिफल ज्योतिष के आधार पर है। सुनिश्चित परिणाम नहीं।*"""
+        lang_note = "पूरी राशिफल हिंदी में लिखें। राशि, कुंडली, लग्न, ग्रह, गोचर, भाग्य जैसे हिंदी शब्द उपयोग करें।"
+    else:
+        structure = """🌅 **Today's Energy**
+2-3 sentences about overall energy for this sign.
 
 💼 **Work & Ambition**
-1-2 sentences specific to career/study energy today.
+1-2 sentences about career/study energy today.
 
 ❤️ **Heart & Relationships**
 1-2 sentences about emotional and relationship energy.
@@ -215,90 +128,173 @@ Write a warm, personal daily rasiphal (horoscope) for {name} today. Structure it
 2-3 practical suggestions aligned with their sign and diary mood.
 
 ⚠️ **What to be careful about**
-1-2 honest cautions. Don't sugarcoat.
+1-2 honest cautions.
 
 ✨ **Medha's Cosmic Note**
-One personal sentence connecting their recent diary feelings to today's cosmic energy. Make this feel like Medha actually read their diary.
+One personal sentence connecting their diary feelings to today's cosmic energy.
 
-Keep the total under 250 words. Write warmly, like a wise friend — not like a generic horoscope website.
+End with:
+*All insights are based on Vedic astrology. Not guaranteed outcomes.*"""
+        lang_note = "Write the entire forecast in English."
 
-{lang_note}
-"""
+    prompt = f"""You are Astro Medha, a warm and wise astrology guide.
+
+Today is {today_fmt}.
+User's sun sign (राशि): {zodiac}
+Their nature: {traits}
+Born in: {profile.get('birth_place', 'India')}
+
+Their recent diary entries:
+{diary_context if diary_context else "No recent entries."}
+
+Write a warm, personal daily rasiphal for {name}. {lang_note}
+
+Use this structure:
+{structure}
+
+Keep total under 250 words. Write like a wise friend, not a generic horoscope."""
+
+    response = _groq.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": "You are Astro Medha — warm, wise, personal. Follow language instructions strictly."},
+            {"role": "user",   "content": prompt},
+        ],
+        max_tokens=600,
+        temperature=0.7,
+    )
+    return response.choices[0].message.content.strip()
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@router.post("/astro/language")
+async def update_language(body: LanguageUpdate, user_id: str = Depends(verify_token)):
+    sb = get_sb()
+    if body.language not in ("hindi", "english"):
+        raise HTTPException(status_code=400, detail="language must be 'hindi' or 'english'")
+
+    sb.table("profiles").update({"astro_language": body.language})\
+        .eq("id", user_id).execute()
+
+    # ── Delete today's cached forecast so it regenerates in new language ──
+    today = date.today().isoformat()
+    sb.table("astro_forecasts")\
+        .delete()\
+        .eq("user_id", user_id)\
+        .eq("date", today)\
+        .execute()
+
+    return {"language": body.language}
+
+
+@router.post("/astro/onboard")
+async def astro_onboard(body: OnboardingData, user_id: str = Depends(verify_token)):
+    sb     = get_sb()
+    zodiac = get_zodiac(body.dob)
+
+    profile_res = sb.table("profiles")\
+        .select("astro_onboarded, astro_edit_count")\
+        .eq("id", user_id).single().execute()
+    profile = profile_res.data or {}
+
+    already_onboarded = profile.get("astro_onboarded", False)
+    edit_count        = profile.get("astro_edit_count", 0)
+
+    if already_onboarded:
+        if edit_count >= 2:
+            raise HTTPException(
+                status_code=403,
+                detail="You have used both your allowed birth info edits."
+            )
+        new_edit_count = edit_count + 1
+    else:
+        new_edit_count = 0
+
+    sb.table("profiles").update({
+        "dob":              body.dob,
+        "birth_time":       body.birth_time,
+        "birth_place":      body.birth_place,
+        "zodiac_sign":      zodiac,
+        "astro_onboarded":  True,
+        "astro_edit_count": new_edit_count,
+    }).eq("id", user_id).execute()
+
+    return {
+        "zodiac_sign":      zodiac,
+        "astro_edit_count": new_edit_count,
+        "message":          "Astro profile saved",
+    }
+
+
+@router.get("/astro/profile")
+async def get_astro_profile(user_id: str = Depends(verify_token)):
+    sb  = get_sb()
+    res = sb.table("profiles")\
+        .select("is_premium, astro_onboarded, dob, birth_time, birth_place, zodiac_sign, display_name, astro_edit_count, astro_language")\
+        .eq("id", user_id).single().execute()
+    return res.data or {}
+
+
+@router.get("/astro/forecast")
+async def get_daily_forecast(user_id: str = Depends(verify_token)):
+    sb    = get_sb()
+    today = date.today().isoformat()
+
+    # Get profile FIRST — need language before checking cache
+    profile_res = sb.table("profiles")\
+        .select("zodiac_sign, dob, birth_place, display_name, ai_name, astro_language")\
+        .eq("id", user_id).single().execute()
+    profile  = profile_res.data or {}
+    language = profile.get("astro_language") or "english"  # ← never None
+
+    # Check cache — only use if language matches
+    cached = sb.table("astro_forecasts")\
+        .select("forecast, language")\
+        .eq("user_id", user_id)\
+        .eq("date", today)\
+        .execute()
+
+    if cached.data:
+        cached_lang = cached.data[0].get("language", "english")
+        if cached_lang == language:
+            return {"forecast": cached.data[0]["forecast"], "date": today, "cached": True}
+        # Language changed — delete stale cache and regenerate
+        sb.table("astro_forecasts").delete().eq("user_id", user_id).eq("date", today).execute()
 
     try:
-        response = _groq.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": "You are Astro Medha — warm, wise, personal. Never make hard predictions about specific dates or guaranteed events."},
-                {"role": "user",   "content": prompt},
-            ],
-            max_tokens=600,
-            temperature=0.7,
-        )
-        forecast = response.choices[0].message.content.strip()
+        forecast = await _generate_forecast(user_id, language, profile, sb)
 
-        # Cache it
         sb.table("astro_forecasts").upsert({
             "user_id":  user_id,
             "date":     today,
             "forecast": forecast,
+            "language": language,   # ← store language with cache
         }).execute()
 
         return {"forecast": forecast, "date": today, "cached": False}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
-@router.post("/astro/send-daily-notifications")
-async def send_daily_notifications():
-    """
-    Called by Render cron at 6:30 AM IST daily.
-    Generates and caches forecast for all premium users.
-    """
-    sb = get_sb()
-
-    premium_users = sb.table("profiles")\
-        .select("id, zodiac_sign, display_name, ai_name")\
-        .eq("is_premium", True)\
-        .eq("astro_onboarded", True)\
-        .execute()
-
-    count = 0
-    for user in (premium_users.data or []):
-        try:
-            # Trigger forecast generation (it caches automatically)
-            # In production: call get_daily_forecast logic here directly
-            # and then send push notification via Expo push API
-            uid  = user["id"]
-            name = (user.get("display_name") or "").split(" ")[0] or "friend"
-
-            # Get expo push token from your profiles/devices table
-            # push_token = get_push_token(uid)
-            # send_push(push_token, f"🌟 {name}, your cosmic forecast is ready!")
-
-            count += 1
-        except Exception as e:
-            print(f"Failed for user {user['id']}: {e}")
-
-    return {"sent": count}
 
 
 @router.post("/astro/chat")
 async def astro_chat(body: AstroChatMessage, user_id: str = Depends(verify_token)):
     sb = get_sb()
 
-    # Verify premium
+    # ── Fetch profile INCLUDING astro_language ──
     profile_res = sb.table("profiles")\
-        .select("is_premium, zodiac_sign, dob, birth_place, birth_time, display_name")\
+        .select("is_premium, zodiac_sign, dob, birth_place, birth_time, display_name, astro_language")\
         .eq("id", user_id).single().execute()
     profile = profile_res.data or {}
 
     if not profile.get("is_premium"):
         raise HTTPException(status_code=403, detail="Premium required")
 
-    zodiac  = profile.get("zodiac_sign", "Unknown")
-    name    = (profile.get("display_name") or "").split(" ")[0] or "you"
-    traits  = ZODIAC_TRAITS.get(zodiac, "thoughtful and sensitive")
+    zodiac   = profile.get("zodiac_sign", "Unknown")
+    name     = (profile.get("display_name") or "").split(" ")[0] or "you"
+    traits   = ZODIAC_TRAITS.get(zodiac, "thoughtful and sensitive")
+    language = profile.get("astro_language") or "english"  # ← never None
 
     # Get or create session
     session_id = body.session_id
@@ -309,7 +305,7 @@ async def astro_chat(body: AstroChatMessage, user_id: str = Depends(verify_token
         }).execute()
         session_id = session_res.data[0]["id"]
 
-    # Get conversation history
+    # Conversation history
     history_res = sb.table("astro_messages")\
         .select("role, content")\
         .eq("session_id", session_id)\
@@ -317,7 +313,7 @@ async def astro_chat(body: AstroChatMessage, user_id: str = Depends(verify_token
         .limit(20).execute()
     history = history_res.data or []
 
-    # Get recent diary for context
+    # Recent diary entries
     entries_res = sb.table("diary_entries")\
         .select("content, entry_date, mood_label")\
         .eq("user_id", user_id)\
@@ -331,23 +327,20 @@ async def astro_chat(body: AstroChatMessage, user_id: str = Depends(verify_token
             f"- {e['entry_date']} ({e.get('mood_label','neutral')}): {e['content'][:200]}"
             for e in entries_res.data
         ])
-    language = profile.get("astro_language", "english")
 
+    # ── Language instructions ──
     if language == "hindi":
-        lang_instruction = """आप हिंदी में जवाब दें। ज्योतिष के शब्द हिंदी में उपयोग करें जैसे:
-- Zodiac sign → राशि
-- Ascendant → लग्न
-- Moon sign → चंद्र राशि  
-- Horoscope → कुंडली
-- Planet → ग्रह
-- Transit → गोचर
-- Destiny → भाग्य
-- Marriage → विवाह
-- Career → करियर
-- Fortune → किस्मत
-पूरा जवाब हिंदी में लिखें। अंग्रेज़ी शब्द केवल तब उपयोग करें जब कोई हिंदी शब्द न हो।"""
+        lang_instruction = """IMPORTANT: तुम्हें पूरा जवाब हिंदी में देना है। कोई भी वाक्य अंग्रेज़ी में मत लिखो।
+
+ज्योतिष के लिए इन हिंदी शब्दों का उपयोग करो:
+राशि (zodiac sign), कुंडली (horoscope/birth chart), लग्न (ascendant),
+चंद्र राशि (moon sign), ग्रह (planet), गोचर (transit),
+भाग्य (destiny/luck), विवाह (marriage), करियर, किस्मत,
+दशा/अंतर्दशा (time period), नक्षत्र (constellation)"""
+        disclaimer = "_ज्योतिष के अनुसार जानकारी दी गई है। यह सुनिश्चित परिणाम नहीं हैं।_"
     else:
-        lang_instruction = "Respond in English."
+        lang_instruction = "Respond in English only. Do not use Hindi."
+        disclaimer = "_Astro Medha's insights are based on astrological patterns. Not guaranteed outcomes._"
 
     system_prompt = f"""You are Astro Medha — a wise, warm astrology guide who deeply knows {name}.
 
@@ -357,20 +350,21 @@ async def astro_chat(body: AstroChatMessage, user_id: str = Depends(verify_token
 - Born in: {profile.get('birth_place', 'India')}
 - Birth time: {profile.get('birth_time', 'unknown')}
 
-Their recent diary entries (for personal context):
+Their recent diary entries (personal context):
 {diary_context if diary_context else "No diary entries yet."}
 
-Language instruction: {lang_instruction}
+{lang_instruction}
 
 Your role:
-- Answer questions about their future, relationships, career, and life using astrology as a lens
-- Always weave in what their diary reveals about them — make it feel personal
-- Be warm, honest, and grounded — never make hard date-specific predictions
-- For sensitive questions (marriage, death, illness) be compassionate and redirect to patterns and possibilities, not certainties
+- Answer questions about future, relationships, career, life using astrology as a lens
+- Weave in what their diary reveals — make it feel personal
+- Be warm, honest, grounded — never make hard date-specific predictions
+- For sensitive questions (marriage, death, illness) be compassionate, focus on patterns not certainties
 - Keep responses under 150 words unless the question needs more depth
 
-IMPORTANT: End every response with this disclaimer (in the same language as your response):
-{"_ज्योतिष के अनुसार जानकारी दी गई है। यह सुनिश्चित परिणाम नहीं हैं।_" if language == "hindi" else "_Astro Medha's insights are based on astrological patterns. Not guaranteed outcomes._"}"""
+End EVERY response with this exact line on its own:
+{disclaimer}"""
+
     messages = [{"role": "system", "content": system_prompt}]
     for h in history:
         messages.append({"role": h["role"], "content": h["content"]})
@@ -385,7 +379,6 @@ IMPORTANT: End every response with this disclaimer (in the same language as your
         )
         reply = response.choices[0].message.content.strip()
 
-        # Save both messages
         sb.table("astro_messages").insert([
             {"session_id": session_id, "user_id": user_id, "role": "user",      "content": body.message},
             {"session_id": session_id, "user_id": user_id, "role": "assistant",  "content": reply},
@@ -395,3 +388,22 @@ IMPORTANT: End every response with this disclaimer (in the same language as your
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/astro/send-daily-notifications")
+async def send_daily_notifications():
+    sb = get_sb()
+    premium_users = sb.table("profiles")\
+        .select("id, zodiac_sign, display_name, ai_name")\
+        .eq("is_premium", True)\
+        .eq("astro_onboarded", True)\
+        .execute()
+
+    count = 0
+    for user in (premium_users.data or []):
+        try:
+            count += 1
+        except Exception as e:
+            print(f"Failed for user {user['id']}: {e}")
+
+    return {"sent": count}

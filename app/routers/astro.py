@@ -67,14 +67,47 @@ class OnboardingData(BaseModel):
 class AstroChatMessage(BaseModel):
     session_id: str | None
     message:    str
-
+class LanguageUpdate(BaseModel):
+    language: str  # 'hindi' or 'english'
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+@router.post("/astro/language")
+async def update_language(body: LanguageUpdate, user_id: str = Depends(verify_token)):
+    sb = get_sb()
+    if body.language not in ("hindi", "english"):
+        raise HTTPException(status_code=400, detail="language must be 'hindi' or 'english'")
+    sb.table("profiles").update({"astro_language": body.language})\
+        .eq("id", user_id).execute()
+    return {"language": body.language}
+
+
+
+
 @router.post("/astro/onboard")
 async def astro_onboard(body: OnboardingData, user_id: str = Depends(verify_token)):
-    sb      = get_sb()
-    zodiac  = get_zodiac(body.dob)
+    sb     = get_sb()
+    zodiac = get_zodiac(body.dob)
+
+    # Check current state
+    profile_res = sb.table("profiles")\
+        .select("astro_onboarded, astro_edit_count")\
+        .eq("id", user_id).single().execute()
+    profile     = profile_res.data or {}
+
+    already_onboarded = profile.get("astro_onboarded", False)
+    edit_count        = profile.get("astro_edit_count", 0)
+
+    # If editing (not first time), check limit
+    if already_onboarded:
+        if edit_count >= 2:
+            raise HTTPException(
+                status_code=403,
+                detail="You have used both your allowed birth info edits."
+            )
+        new_edit_count = edit_count + 1
+    else:
+        new_edit_count = 0  # first time setup doesn't count
 
     sb.table("profiles").update({
         "dob":             body.dob,
@@ -82,16 +115,20 @@ async def astro_onboard(body: OnboardingData, user_id: str = Depends(verify_toke
         "birth_place":     body.birth_place,
         "zodiac_sign":     zodiac,
         "astro_onboarded": True,
+        "astro_edit_count": new_edit_count,
     }).eq("id", user_id).execute()
 
-    return {"zodiac_sign": zodiac, "message": "Astro profile saved"}
-
+    return {
+        "zodiac_sign":     zodiac,
+        "astro_edit_count": new_edit_count,
+        "message":         "Astro profile saved",
+    }
 
 @router.get("/astro/profile")
 async def get_astro_profile(user_id: str = Depends(verify_token)):
     sb  = get_sb()
     res = sb.table("profiles")\
-        .select("is_premium, astro_onboarded, dob, birth_time, birth_place, zodiac_sign, display_name")\
+        .select("is_premium, astro_onboarded, dob, birth_time, birth_place, zodiac_sign, display_name, astro_edit_count, astro_language")\
         .eq("id", user_id).single().execute()
     return res.data or {}
 
@@ -113,9 +150,24 @@ async def get_daily_forecast(user_id: str = Depends(verify_token)):
 
     # Get user astro profile
     profile_res = sb.table("profiles")\
-        .select("zodiac_sign, dob, birth_place, display_name, ai_name")\
+        .select("zodiac_sign, dob, birth_place, display_name, ai_name, astro_language")\
         .eq("id", user_id).single().execute()
     profile = profile_res.data or {}
+
+    language = profile.get("astro_language", "english")
+
+    if language == "hindi":
+        lang_note = """पूरी राशिफल हिंदी में लिखें। इन शब्दों का उपयोग करें:
+                        राशि, कुंडली, लग्न, चंद्र राशि, ग्रह, गोचर, भाग्य, करियर, प्रेम, स्वास्थ्य।
+
+                        अंत में यह पंक्ति जोड़ें:
+                        *यह राशिफल ज्योतिष के आधार पर है। सुनिश्चित परिणाम नहीं।*"""
+    else:
+        lang_note = """Write the forecast in English.
+
+                    End with:
+                    *All insights are based on Vedic astrology and your personal profile. Medha's answers reflect astrological patterns, not guaranteed outcomes.*"""
+
 
     zodiac = profile.get("zodiac_sign", "Unknown")
     name   = (profile.get("display_name") or "").split(" ")[0] or "you"
@@ -169,8 +221,9 @@ Write a warm, personal daily rasiphal (horoscope) for {name} today. Structure it
 One personal sentence connecting their recent diary feelings to today's cosmic energy. Make this feel like Medha actually read their diary.
 
 Keep the total under 250 words. Write warmly, like a wise friend — not like a generic horoscope website.
-At the end add exactly this line on its own:
-_All insights are based on Vedic astrology and your personal profile. Medha's answers reflect astrological patterns, not guaranteed outcomes._"""
+
+{lang_note}
+"""
 
     try:
         response = _groq.chat.completions.create(
@@ -278,17 +331,36 @@ async def astro_chat(body: AstroChatMessage, user_id: str = Depends(verify_token
             f"- {e['entry_date']} ({e.get('mood_label','neutral')}): {e['content'][:200]}"
             for e in entries_res.data
         ])
+    language = profile.get("astro_language", "english")
+
+    if language == "hindi":
+        lang_instruction = """आप हिंदी में जवाब दें। ज्योतिष के शब्द हिंदी में उपयोग करें जैसे:
+- Zodiac sign → राशि
+- Ascendant → लग्न
+- Moon sign → चंद्र राशि  
+- Horoscope → कुंडली
+- Planet → ग्रह
+- Transit → गोचर
+- Destiny → भाग्य
+- Marriage → विवाह
+- Career → करियर
+- Fortune → किस्मत
+पूरा जवाब हिंदी में लिखें। अंग्रेज़ी शब्द केवल तब उपयोग करें जब कोई हिंदी शब्द न हो।"""
+    else:
+        lang_instruction = "Respond in English."
 
     system_prompt = f"""You are Astro Medha — a wise, warm astrology guide who deeply knows {name}.
 
 {name}'s astrology profile:
-- Sun sign: {zodiac}
-- Nature: {traits}  
+- Sun sign (राशि): {zodiac}
+- Nature: {traits}
 - Born in: {profile.get('birth_place', 'India')}
 - Birth time: {profile.get('birth_time', 'unknown')}
 
 Their recent diary entries (for personal context):
 {diary_context if diary_context else "No diary entries yet."}
+
+Language instruction: {lang_instruction}
 
 Your role:
 - Answer questions about their future, relationships, career, and life using astrology as a lens
@@ -297,9 +369,8 @@ Your role:
 - For sensitive questions (marriage, death, illness) be compassionate and redirect to patterns and possibilities, not certainties
 - Keep responses under 150 words unless the question needs more depth
 
-IMPORTANT: End every response with this exact disclaimer on its own line:
-_Astro Medha's insights are based on astrological patterns. Not guaranteed outcomes._"""
-
+IMPORTANT: End every response with this disclaimer (in the same language as your response):
+{"_ज्योतिष के अनुसार जानकारी दी गई है। यह सुनिश्चित परिणाम नहीं हैं।_" if language == "hindi" else "_Astro Medha's insights are based on astrological patterns. Not guaranteed outcomes._"}"""
     messages = [{"role": "system", "content": system_prompt}]
     for h in history:
         messages.append({"role": h["role"], "content": h["content"]})

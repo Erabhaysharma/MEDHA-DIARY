@@ -105,7 +105,7 @@ from app.routers import astro as astro_router
 app.include_router(astro_router.router, prefix="/api", tags=["Astro"])
 
 
-from app.routers import payments as payments_router
+from app.routers import payment as payments_router
 app.include_router(payments_router.router, prefix="/api", tags=["Payments"])
 #_____________Extented feature for add socisl diary feature____________________
 from app.routers import social as social_router   # ← add this

@@ -1,7 +1,6 @@
 """
 payments.py — Razorpay integration
 """
-
 import os
 import hmac
 import hashlib
@@ -24,14 +23,9 @@ def get_razorpay():
 
 @router.post("/payments/create-link")
 async def create_payment_link(user_id: str = Depends(verify_token)):
-    """
-    Creates a fresh Razorpay payment link with user_id embedded in notes.
-    Called when user taps Subscribe in the app.
-    """
     client  = get_razorpay()
     sb      = get_sb()
 
-    # Get user profile for prefilling
     profile = sb.table("profiles")\
         .select("display_name")\
         .eq("id", user_id).single().execute()
@@ -39,11 +33,11 @@ async def create_payment_link(user_id: str = Depends(verify_token)):
 
     try:
         link = client.payment_link.create({
-            "amount":      14900,   # ₹149 in paise
+            "amount":      14900,
             "currency":    "INR",
             "description": "Astro Medha Premium — Monthly",
             "notes": {
-                "user_id": user_id,   # ← this is how we know who paid
+                "user_id": user_id,
             },
             "customer": {
                 "name": name,
@@ -53,14 +47,29 @@ async def create_payment_link(user_id: str = Depends(verify_token)):
                 "email": False,
             },
             "reminder_enable": False,
-            "callback_url":    os.getenv("APP_SCHEME", "medha://") + "payment-success",
-            "callback_method": "get",
+            "options": {
+                "checkout": {
+                    "method": {
+                        "upi":        1,
+                        "card":       1,
+                        "netbanking": 0,
+                        "wallet":     0,
+                    },
+                    "prefill": {
+                        "name": name,
+                    },
+                    "theme": {
+                        "color": "#C8A96E"
+                    }
+                }
+            },
+            # ← callback_url removed entirely
         })
         return {"payment_url": link["short_url"]}
 
     except Exception as e:
+        print(f"Razorpay error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @router.post("/payments/webhook")
 async def razorpay_webhook(request: Request):

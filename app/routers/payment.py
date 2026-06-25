@@ -33,7 +33,7 @@ async def create_payment_link(user_id: str = Depends(verify_token)):
 
     try:
         link = client.payment_link.create({
-            "amount":      14900,
+            "amount":      100,
             "currency":    "INR",
             "description": "Astro Medha Premium — Monthly",
             "notes": {

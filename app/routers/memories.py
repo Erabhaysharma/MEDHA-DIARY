@@ -136,3 +136,130 @@ Rules:
         raise HTTPException(status_code=500, detail="Could not generate memory cards")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+
+@router.get("/trends")
+async def get_trends(user_id: str = Depends(verify_token)):
+    """
+    Analyze diary entries and return trend scores over time.
+    Each trend scored 1-10 per entry using LLM.
+    """
+    supabase = get_supabase()
+
+    entries_resp = supabase.table("diary_entries")\
+        .select("id, content, entry_date, mood_label, mood_score")\
+        .eq("user_id", user_id)\
+        .eq("is_deleted", False)\
+        .order("entry_date", desc=False)\
+        .limit(30)\
+        .execute()
+
+    entries = entries_resp.data or []
+
+    if len(entries) < 2:
+        return {"trends": [], "has_data": False}
+
+    # Format entries for LLM
+    entries_text = "\n\n".join([
+        f"[{e['entry_date']}]: {e['content'][:400]}"
+        for e in entries
+    ])
+
+    prompt = f"""Analyze these diary entries and score each date on 5 dimensions.
+
+ENTRIES:
+{entries_text}
+
+For each date that has an entry, give scores 1-10 for:
+1. mood_happiness: Overall mood, happiness, emotional wellbeing
+2. productivity: Tasks completed, work done, goals achieved  
+3. health: Sleep quality, exercise, physical wellbeing, energy
+4. learning: New skills learned, books read, growth mindset
+5. career: Work progress, career moves, professional achievements
+
+Rules:
+- Score 1-3: Very low/negative mentions or absence
+- Score 4-6: Neutral or moderate
+- Score 7-10: Strong positive mentions
+- If a dimension is not mentioned at all, score 5 (neutral)
+- Be consistent across dates
+
+Return ONLY valid JSON:
+{{
+  "scores": [
+    {{
+      "date": "2024-01-15",
+      "mood_happiness": 7,
+      "productivity": 6,
+      "health": 5,
+      "learning": 4,
+      "career": 6
+    }}
+  ]
+}}"""
+
+    try:
+        response = _groq.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {{"role": "system", "content": "You are a diary analyst. Return only valid JSON."}},
+                {{"role": "user",   "content": prompt}},
+            ],
+            max_tokens=2000,
+            temperature=0.2,
+        )
+
+        raw = response.choices[0].message.content.strip()
+        if "```" in raw:
+            parts = raw.split("```")
+            for part in parts:
+                part = part.strip()
+                if part.startswith("json"):
+                    part = part[4:].strip()
+                if part.startswith("{"):
+                    raw = part
+                    break
+
+        parsed  = json.loads(raw)
+        scores  = parsed.get("scores", [])
+
+        # Build 5 trend objects
+        def build_trend(key, label, emoji, color, gradient):
+            points = [
+                {"date": s["date"], "value": s.get(key, 5)}
+                for s in scores
+            ]
+            values = [p["value"] for p in points]
+            avg    = round(sum(values) / len(values), 1) if values else 5.0
+            trend  = "up" if len(values) > 1 and values[-1] > values[0] else \
+                     "down" if len(values) > 1 and values[-1] < values[0] else "flat"
+            return {
+                "key":      key,
+                "label":    label,
+                "emoji":    emoji,
+                "color":    color,
+                "gradient": gradient,
+                "points":   points,
+                "avg":      avg,
+                "trend":    trend,
+                "latest":   values[-1] if values else 5,
+            }
+
+        trends = [
+            build_trend("mood_happiness", "Mood & Happiness", "😊",
+                        "#C8A96E", "#A88B52"),
+            build_trend("productivity",   "Productivity",     "⚡",
+                        "#5A8AAE", "#3A6A8E"),
+            build_trend("health",         "Health Score",     "❤️",
+                        "#9E7A9E", "#7E5A7E"),
+            build_trend("learning",       "Learning Growth",  "📚",
+                        "#6A9E72", "#4A7A52"),
+            build_trend("career",         "Career Growth",    "💼",
+                        "#C87A52", "#A85A32"),
+        ]
+
+        return {"trends": trends, "has_data": True}
+
+    except Exception as e:
+        print(f"Trend analysis error: {e}")
+        return {"trends": [], "has_data": False}

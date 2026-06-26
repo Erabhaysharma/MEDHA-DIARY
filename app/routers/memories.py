@@ -1,19 +1,16 @@
 """
-memories.py — Generate AI memory cards from diary entries
-
-Called when user has 5+ entries.
-Returns colorful emotion-tagged memory cards based on diary patterns.
+memories.py — Generate AI memory cards and life trend graphs from diary entries.
 """
 
 import json
-from fastapi import APIRouter, Depends, HTTPException
-from supabase import create_client
-from groq import Groq
 import os
+from datetime import date
+
+from fastapi        import APIRouter, Depends, HTTPException
+from supabase       import create_client
+from groq           import Groq
 
 from app.auth import verify_token
-from app.service.embeddings import embed_query
-from app.service.vector_store import search_similar
 
 router = APIRouter()
 _groq  = Groq(api_key=os.getenv("GROQ_API_KEY"))
@@ -26,18 +23,36 @@ def get_supabase():
     )
 
 
+# ── Shared JSON cleaner ───────────────────────────────────────────────────────
+def extract_json(raw: str) -> str:
+    """Strip markdown fences and return clean JSON string."""
+    raw = raw.strip()
+    if "```" in raw:
+        for part in raw.split("```"):
+            part = part.strip()
+            if part.startswith("json"):
+                part = part[4:].strip()
+            if part.startswith("{"):
+                return part
+    return raw
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MEMORY CARDS
+# ─────────────────────────────────────────────────────────────────────────────
+
 @router.get("/memory-cards")
 async def get_memory_cards(user_id: str = Depends(verify_token)):
     """
     Generate colorful emotion-based memory cards from diary entries.
-    Returns 4-8 cards, each with an emotion, color, summary, and date range.
+    Cached once per day on the profiles table — instant on repeat loads.
     """
     supabase = get_supabase()
 
-    # Get profile
-    profile_resp = supabase.table("profiles")\
-        .select("display_name, ai_name, total_entries")\
-        .eq("id", user_id)\
+    # ── Fetch profile (includes cache fields) ──
+    profile_resp = supabase.table("profiles") \
+        .select("display_name, ai_name, total_entries, memory_cards_cache, memory_cards_date") \
+        .eq("id", user_id) \
         .execute()
 
     profile       = profile_resp.data[0] if profile_resp.data else {}
@@ -46,26 +61,33 @@ async def get_memory_cards(user_id: str = Depends(verify_token)):
     if total_entries < 5:
         return {"cards": [], "unlocked": False}
 
-    # Get recent diary entries for context
-    entries_resp = supabase.table("diary_entries")\
-        .select("id, content, entry_date, mood_label, mood_score, title")\
-        .eq("user_id", user_id)\
-        .eq("is_deleted", False)\
-        .order("entry_date", desc=True)\
-        .limit(30)\
+    # ── Return cache if generated today ──
+    cached_date  = profile.get("memory_cards_date")
+    cached_cards = profile.get("memory_cards_cache")
+
+    if cached_date == date.today().isoformat() and cached_cards:
+        print(f"Memory cards: serving from cache for user {user_id}")
+        return cached_cards
+
+    # ── Fetch diary entries ──
+    entries_resp = supabase.table("diary_entries") \
+        .select("id, content, entry_date, mood_label, mood_score, title") \
+        .eq("user_id", user_id) \
+        .eq("is_deleted", False) \
+        .order("entry_date", desc=True) \
+        .limit(30) \
         .execute()
 
     entries = entries_resp.data or []
     if not entries:
         return {"cards": [], "unlocked": False}
 
-    # Format entries for the prompt
     entries_text = "\n\n".join([
         f"[{e['entry_date']} — {e.get('mood_label', 'neutral')}]\n{e['content'][:300]}"
         for e in entries
     ])
 
-    user_name = profile.get("display_name", "").split(" ")[0] or "the user"
+    user_name = (profile.get("display_name") or "").split(" ")[0] or "the user"
 
     prompt = f"""Analyze these diary entries from {user_name} and create 5-7 meaningful memory cards.
 
@@ -74,7 +96,7 @@ Each card should capture a distinct emotional theme, pattern, or memorable momen
 ENTRIES:
 {entries_text}
 
-Return ONLY valid JSON in this exact format:
+Return ONLY valid JSON in this exact format — no extra text, no markdown:
 {{
   "cards": [
     {{
@@ -83,75 +105,106 @@ Return ONLY valid JSON in this exact format:
       "emoji": "😊",
       "color": "#6A9E72",
       "gradient_end": "#4A7A52",
-      "title": "Short catchy title (max 4 words)",
-      "summary": "2-3 sentences capturing this emotional pattern or memory. Make it personal and specific to what was written.",
+      "title": "Short punchy title (max 4 words)",
+      "summary": "2-3 sentences capturing this emotional pattern. Make it personal and specific.",
       "date_range": "June 2024",
       "insight": "One honest insight about this pattern"
     }}
   ]
 }}
 
-EMOTION OPTIONS and their colors:
-- joy: #6A9E72 → #4A7A52 (green)
-- love: #C8A96E → #A88B52 (gold)
-- growth: #5A8AAE → #3A6A8E (blue)
-- peace: #8A7A9E → #6A5A7E (purple)
-- energy: #C87A52 → #A85A32 (orange)
-- reflection: #7A9E9E → #5A7E7E (teal)
-- strength: #9E7A7A → #7E5A5A (rose)
-- hope: #C8B86E → #A8984E (amber)
+EMOTION OPTIONS and their exact colors — use ONLY these hex values:
+- joy:        color #6A9E72,  gradient_end #4A7A52  (green)
+- love:       color #C8A96E,  gradient_end #A88B52  (gold)
+- growth:     color #5A8AAE,  gradient_end #3A6A8E  (blue)
+- peace:      color #8A7A9E,  gradient_end #6A5A7E  (purple)
+- energy:     color #C87A52,  gradient_end #A85A32  (orange)
+- reflection: color #7A9E9E,  gradient_end #5A7E7E  (teal)
+- strength:   color #9E7A7A,  gradient_end #7E5A5A  (rose)
+- hope:       color #C8B86E,  gradient_end #A8984E  (amber)
 
 Rules:
-- Make titles SHORT and punchy (max 4 words)
-- Make summaries SPECIFIC to what was actually written — not generic
-- Each card must capture a genuinely different theme
-- Use the EXACT hex colors provided
-- Return 5 to 7 cards"""
+- Titles max 4 words — punchy and emotional
+- Summaries specific to what was actually written — never generic
+- Each card must be a genuinely different emotional theme
+- Return between 5 and 7 cards"""
 
     try:
         response = _groq.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": "You are an expert at analyzing personal diaries and finding emotional patterns. Return only valid JSON."},
-                {"role": "user",   "content": prompt},
+                {
+                    "role":    "system",
+                    "content": "You are an expert at analyzing personal diaries and finding emotional patterns. Return ONLY valid JSON — no markdown, no explanation.",
+                },
+                {"role": "user", "content": prompt},
             ],
             max_tokens=2048,
             temperature=0.5,
         )
 
-        raw = response.choices[0].message.content.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        raw = raw.strip()
-
+        raw    = extract_json(response.choices[0].message.content)
         parsed = json.loads(raw)
-        return {
-            "cards":    parsed.get("cards", []),
-            "unlocked": True,
-        }
 
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="Could not generate memory cards")
+        # Filter out any cards missing required fields
+        valid_cards = [
+            c for c in parsed.get("cards", [])
+            if c.get("title", "").strip()
+            and c.get("summary", "").strip()
+            and c.get("emoji")
+            and c.get("color")
+        ]
+
+        result = {"cards": valid_cards, "unlocked": True}
+
+        # ── Cache on profile ──
+        supabase.table("profiles").update({
+            "memory_cards_cache": result,
+            "memory_cards_date":  date.today().isoformat(),
+        }).eq("id", user_id).execute()
+
+        print(f"Memory cards: generated {len(valid_cards)} cards for user {user_id}")
+        return result
+
+    except json.JSONDecodeError as e:
+        print(f"Memory cards JSON error: {e}")
+        raise HTTPException(status_code=500, detail="Could not parse memory cards response")
     except Exception as e:
+        print(f"Memory cards error: {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-    
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LIFE TREND GRAPHS
+# ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/trends")
 async def get_trends(user_id: str = Depends(verify_token)):
     """
-    Analyze diary entries and return trend scores over time.
-    Each trend scored 1-10 per entry using LLM.
+    Analyze diary entries and return scored life trend data for 5 dimensions.
+    Cached once per day in trend_cache table — instant on repeat loads.
     """
     supabase = get_supabase()
+    today    = date.today()
 
-    entries_resp = supabase.table("diary_entries")\
-        .select("id, content, entry_date, mood_label, mood_score")\
-        .eq("user_id", user_id)\
-        .eq("is_deleted", False)\
-        .order("entry_date", desc=False)\
-        .limit(30)\
+    # ── Check trend cache ──
+    cached = supabase.table("trend_cache") \
+        .select("data") \
+        .eq("user_id", user_id) \
+        .eq("date", today.isoformat()) \
+        .execute()
+
+    if cached.data:
+        print(f"Trends: serving from cache for user {user_id}")
+        return cached.data[0]["data"]
+
+    # ── Fetch diary entries ──
+    entries_resp = supabase.table("diary_entries") \
+        .select("id, content, entry_date, mood_label, mood_score") \
+        .eq("user_id", user_id) \
+        .eq("is_deleted", False) \
+        .order("entry_date", desc=False) \
+        .limit(30) \
         .execute()
 
     entries = entries_resp.data or []
@@ -159,107 +212,127 @@ async def get_trends(user_id: str = Depends(verify_token)):
     if len(entries) < 2:
         return {"trends": [], "has_data": False}
 
-    # Format entries for LLM
     entries_text = "\n\n".join([
-        f"[{e['entry_date']}]: {e['content'][:400]}"
+        f"[{e['entry_date']} | mood: {e.get('mood_label', 'neutral')}]\n{e['content'][:300]}"
         for e in entries
     ])
 
-    prompt = f"""Analyze these diary entries and score each date on 5 dimensions.
+    prompt = f"""Analyze these diary entries and score each date on 5 life dimensions.
 
-ENTRIES:
+DIARY ENTRIES:
 {entries_text}
 
-For each date that has an entry, give scores 1-10 for:
-1. mood_happiness: Overall mood, happiness, emotional wellbeing
-2. productivity: Tasks completed, work done, goals achieved  
-3. health: Sleep quality, exercise, physical wellbeing, energy
-4. learning: New skills learned, books read, growth mindset
-5. career: Work progress, career moves, professional achievements
+For EVERY date listed above, give integer scores 1-10 for each dimension:
+- mood_happiness : overall emotional wellbeing, happiness, positivity
+- productivity   : tasks completed, goals achieved, focused work done
+- health         : sleep quality, exercise, physical energy, body care
+- learning       : new skills, books read, courses, intellectual growth
+- career         : work progress, career moves, professional achievements
 
-Rules:
-- Score 1-3: Very low/negative mentions or absence
-- Score 4-6: Neutral or moderate
-- Score 7-10: Strong positive mentions
-- If a dimension is not mentioned at all, score 5 (neutral)
-- Be consistent across dates
+Scoring guide:
+  1-3  = very negative mentions OR completely absent from this entry
+  4-6  = neutral, routine, or moderately mentioned
+  7-10 = strong positive mentions, clearly a good day for this dimension
 
-Return ONLY valid JSON:
+IMPORTANT: Return ONLY this exact JSON. No markdown, no explanation, no extra text.
 {{
   "scores": [
     {{
-      "date": "2024-01-15",
+      "date": "YYYY-MM-DD",
       "mood_happiness": 7,
-      "productivity": 6,
-      "health": 5,
-      "learning": 4,
-      "career": 6
+      "productivity":   6,
+      "health":         5,
+      "learning":       4,
+      "career":         6
     }}
   ]
-}}"""
+}}
+
+Include one object per diary entry date. Match dates exactly as given above."""
 
     try:
         response = _groq.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {{"role": "system", "content": "You are a diary analyst. Return only valid JSON."}},
-                {{"role": "user",   "content": prompt}},
+                {
+                    "role":    "system",
+                    "content": "You are a diary analyst. Return ONLY valid JSON — no markdown, no explanation, no extra text.",
+                },
+                {"role": "user", "content": prompt},
             ],
             max_tokens=2000,
-            temperature=0.2,
+            temperature=0.1,
         )
 
-        raw = response.choices[0].message.content.strip()
-        if "```" in raw:
-            parts = raw.split("```")
-            for part in parts:
-                part = part.strip()
-                if part.startswith("json"):
-                    part = part[4:].strip()
-                if part.startswith("{"):
-                    raw = part
-                    break
+        raw    = extract_json(response.choices[0].message.content)
+        parsed = json.loads(raw)
+        scores = parsed.get("scores", [])
 
-        parsed  = json.loads(raw)
-        scores  = parsed.get("scores", [])
+        if not scores:
+            print(f"Trends: LLM returned empty scores for user {user_id}")
+            return {"trends": [], "has_data": False}
 
-        # Build 5 trend objects
-        def build_trend(key, label, emoji, color, gradient):
-            points = [
-                {"date": s["date"], "value": s.get(key, 5)}
-                for s in scores
-            ]
-            values = [p["value"] for p in points]
-            avg    = round(sum(values) / len(values), 1) if values else 5.0
-            trend  = "up" if len(values) > 1 and values[-1] > values[0] else \
-                     "down" if len(values) > 1 and values[-1] < values[0] else "flat"
+        def build_trend(key: str, label: str, emoji: str, color: str):
+            points = []
+            for s in scores:
+                raw_val = s.get(key)
+                if raw_val is None:
+                    continue
+                try:
+                    val = max(1, min(10, int(float(raw_val))))
+                    points.append({"date": s["date"], "value": val})
+                except (TypeError, ValueError):
+                    continue
+
+            if not points:
+                return None
+
+            values    = [p["value"] for p in points]
+            avg       = round(sum(values) / len(values), 1)
+
+            # Compare first 3 vs last 3 for trend direction
+            n          = min(3, len(values))
+            first_avg  = sum(values[:n]) / n
+            last_avg   = sum(values[-n:]) / n
+            diff       = last_avg - first_avg
+            trend      = "up" if diff > 0.5 else "down" if diff < -0.5 else "flat"
+
             return {
-                "key":      key,
-                "label":    label,
-                "emoji":    emoji,
-                "color":    color,
-                "gradient": gradient,
-                "points":   points,
-                "avg":      avg,
-                "trend":    trend,
-                "latest":   values[-1] if values else 5,
+                "key":    key,
+                "label":  label,
+                "emoji":  emoji,
+                "color":  color,
+                "points": points,
+                "avg":    avg,
+                "trend":  trend,
+                "latest": values[-1],
             }
 
-        trends = [
-            build_trend("mood_happiness", "Mood & Happiness", "😊",
-                        "#C8A96E", "#A88B52"),
-            build_trend("productivity",   "Productivity",     "⚡",
-                        "#5A8AAE", "#3A6A8E"),
-            build_trend("health",         "Health Score",     "❤️",
-                        "#9E7A9E", "#7E5A7E"),
-            build_trend("learning",       "Learning Growth",  "📚",
-                        "#6A9E72", "#4A7A52"),
-            build_trend("career",         "Career Growth",    "💼",
-                        "#C87A52", "#A85A32"),
+        trends_raw = [
+            build_trend("mood_happiness", "Mood & Happiness", "😊", "#C8A96E"),
+            build_trend("productivity",   "Productivity",     "⚡", "#5A8AAE"),
+            build_trend("health",         "Health Score",     "❤️", "#9E7A9E"),
+            build_trend("learning",       "Learning Growth",  "📚", "#6A9E72"),
+            build_trend("career",         "Career Growth",    "💼", "#C87A52"),
         ]
+        trends = [t for t in trends_raw if t is not None]
 
-        return {"trends": trends, "has_data": True}
+        result = {"trends": trends, "has_data": len(trends) > 0}
 
+        # ── Cache today's result ──
+        supabase.table("trend_cache").upsert({
+            "user_id": user_id,
+            "date":    today.isoformat(),
+            "data":    result,
+        }).execute()
+
+        print(f"Trends: generated {len(trends)} trends for user {user_id}")
+        return result
+
+    except json.JSONDecodeError as e:
+        print(f"Trends JSON error: {e}")
+        print(f"Raw response was: {raw[:400]}")
+        return {"trends": [], "has_data": False}
     except Exception as e:
-        print(f"Trend analysis error: {e}")
+        print(f"Trends error: {type(e).__name__}: {e}")
         return {"trends": [], "has_data": False}
